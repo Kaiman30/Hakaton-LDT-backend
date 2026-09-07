@@ -1,0 +1,1 @@
+update users set role = 'admin' where name = 'Kaiman4ik';
