@@ -1,3 +1,4 @@
+
 """
 Base connector abstractions for core services:
 - LLM connectors
@@ -14,7 +15,7 @@ appropriate base.
 from __future__ import annotations
 
 import abc
-from typing import Any, Dict, List, Optional, AsyncIterator, Type
+from typing import Any, Dict, List, Optional, AsyncIterator
 
 
 class BaseConnector(abc.ABC):
@@ -32,14 +33,7 @@ class BaseConnector(abc.ABC):
     def from_config(cls, config: Any, **kwargs) -> "BaseConnector":
         """
         Create connector instance from config.
-        Subclasses MUST override this method to handle their specific config requirements.
-
-        Args:
-            config: Configuration object (typically Settings)
-            **kwargs: Additional keyword arguments
-
-        Returns:
-            Configured connector instance
+        Subclasses MUST override this method.
         """
         raise NotImplementedError(f"{cls.__name__} must implement from_config()")
 
@@ -75,13 +69,22 @@ class LLMConnector(BaseConnector, abc.ABC):
         file_ids: Optional[List[str]] = None,
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
-        stream: bool = False,
         timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Core chat method.
-        If stream=True, implementation may return an AsyncIterator[str] or similar stream object.
-        """
+    ) -> Dict[str, Any]:
+        """Non-streaming chat. Returns response dict."""
+
+    @abc.abstractmethod
+    async def chat_stream(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        file_ids: Optional[List[str]] = None,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> AsyncIterator[str]:
+        """Streaming chat. Yields text chunks."""
 
     @abc.abstractmethod
     async def upload_file(
@@ -154,8 +157,19 @@ class FileStorageConnector(BaseConnector, abc.ABC):
     ) -> Any:
         """
         Unified download API.
-        Implementations may return bytes or an AsyncGenerator[bytes, None] depending on `use_streaming`.
+        Returns bytes or AsyncIterator[bytes] depending on `use_streaming`.
         """
+
+    @abc.abstractmethod
+    async def upload(
+        self,
+        object_name: str,
+        data: bytes,
+        *,
+        timeout: float = 30.0,
+        **kwargs: Any,
+    ) -> None:
+        """Upload bytes to storage."""
 
 
 class DBConnector(BaseConnector, abc.ABC):
@@ -174,21 +188,30 @@ class DBConnector(BaseConnector, abc.ABC):
         """Execute DML (INSERT/UPDATE/DELETE)."""
 
     @abc.abstractmethod
+    async def get_pool_stats(self) -> Dict[str, Any]:
+        """Get connection pool statistics."""
+
+    @abc.abstractmethod
     async def health_check(self) -> bool:
         """Check DB connectivity."""
-    
+
+
 class HTTPConnector(BaseConnector, abc.ABC):
-    """Base abs class for http services."""
-    
+    """Base abstraction for HTTP services."""
+
+    @property
     @abc.abstractmethod
-    def start(self, ip: str, port: int):
-        """Start http service"""
-        
+    def app(self) -> Any:
+        """Get the web application instance (e.g., FastAPI app)."""
+
     @abc.abstractmethod
-    async def health():
-        """Method for check health of module"""
-        
+    async def start(self, ip: str, port: int) -> None:
+        """Start HTTP service."""
+
     @abc.abstractmethod
-    async def status(status):
-        """Method for check current operation in container"""
-    
+    async def health(self) -> Dict[str, Any]:
+        """Get health status information."""
+
+    @abc.abstractmethod
+    async def status(self, status: Any) -> Dict[str, Any]:
+        """Get current operation status."""

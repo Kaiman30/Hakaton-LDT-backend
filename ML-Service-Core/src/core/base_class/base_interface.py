@@ -7,12 +7,12 @@ switching between different implementations transparently.
 from __future__ import annotations
 
 from abc import ABC
-from typing import Any, Optional
+from typing import Any, Callable, Awaitable, Optional
 import time
 
 from core.base_class.base_connectors import BaseConnector
 from utils.observer import (
-    EventPublisher,
+    UnifiedPublisher,
     ConnectorEvent,
     EventType,
 )
@@ -30,7 +30,7 @@ class BaseInterface(ABC):
         self,
         worker: BaseConnector,
         name: Optional[str] = None,
-        event_publisher: Optional[EventPublisher] = None,
+        publisher: Optional[UnifiedPublisher] = None,
     ):
         """
         Initialize interface with worker.
@@ -38,11 +38,11 @@ class BaseInterface(ABC):
         Args:
             worker: Connector instance (worker) to use
             name: Interface name (defaults to worker name)
-            event_publisher: Optional event publisher for observability
+            publisher: Optional event publisher for observability
         """
         self._worker = worker
         self._name = name or worker.name
-        self._event_publisher = event_publisher
+        self._publisher = publisher
 
     @property
     def name(self) -> str:
@@ -63,24 +63,13 @@ class BaseInterface(ABC):
         """
         old_name = self._worker.name
         self._worker = new_worker
-        if self._event_publisher:
-            event = ConnectorEvent(
+        if self._publisher:
+            self._publisher.emit_sync(ConnectorEvent(
                 event_type=EventType.OPERATION_COMPLETED,
-                connector_name=new_worker.name,
-                interface_name=self._name,
-                operation_name="switch_worker",
+                source=f"{self._name}.switch_worker",
+                action="switch_worker",
                 metadata={"old_worker": old_name, "new_worker": new_worker.name},
-            )
-            # Publish async but don't await (fire and forget)
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.create_task(self._event_publisher.publish(event))
-                else:
-                    loop.run_until_complete(self._event_publisher.publish(event))
-            except RuntimeError:
-                pass  # No event loop, skip publishing
+            ))
 
     async def _publish_event(
         self,
@@ -91,32 +80,30 @@ class BaseInterface(ABC):
         duration_ms: Optional[float] = None,
         metadata: Optional[dict] = None,
     ) -> None:
-        """Publish event to observers"""
-        if not self._event_publisher:
+        """Publish event through unified publisher."""
+        if not self._publisher:
             return
 
-        event = ConnectorEvent(
+        self._publisher.emit_sync(ConnectorEvent(
             event_type=event_type,
-            connector_name=self._worker.name,
-            interface_name=self._name,
-            operation_name=operation_name,
+            source=f"{self._name}.{operation_name}",
+            action=operation_name,
             success=success,
             error=error,
             duration_ms=duration_ms,
             metadata=metadata or {},
-        )
-        await self._event_publisher.publish(event)
+        ))
 
     async def _execute_with_tracking(
         self,
         operation_name: str,
-        operation: Any,
+        operation: Callable[..., Awaitable[Any]],
         *args: Any,
         metadata: Optional[dict] = None,
         **kwargs: Any,
     ) -> Any:
         """
-        Execute operation with event tracking.
+        Execute async operation with event tracking.
 
         Args:
             operation_name: Name of operation for logging
@@ -130,20 +117,18 @@ class BaseInterface(ABC):
         """
         start_time = time.perf_counter()
 
-        # Publish start event
         await self._publish_event(EventType.OPERATION_STARTED, operation_name)
 
         try:
             result = await operation(*args, **kwargs)
             duration_ms = (time.perf_counter() - start_time) * 1000
 
-            # Publish success event with metadata
             await self._publish_event(
                 EventType.OPERATION_COMPLETED,
                 operation_name,
                 success=True,
                 duration_ms=duration_ms,
-                metadata=metadata or {}
+                metadata=metadata or {},
             )
 
             return result
@@ -151,7 +136,6 @@ class BaseInterface(ABC):
         except Exception as e:
             duration_ms = (time.perf_counter() - start_time) * 1000
 
-            # Publish error event
             await self._publish_event(
                 EventType.OPERATION_FAILED,
                 operation_name,
@@ -185,4 +169,3 @@ class BaseInterface(ABC):
     def is_healthy(self) -> bool:
         """Get cached health status"""
         return self._worker.is_healthy()
-

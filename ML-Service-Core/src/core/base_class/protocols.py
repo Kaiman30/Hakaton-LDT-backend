@@ -5,9 +5,10 @@ Useful for type checking and IDE support while keeping flexibility.
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Protocol, AsyncIterator, Union, AsyncGenerator, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, AsyncIterator, Union, runtime_checkable
 from datetime import datetime
 from core.registry import register_protocol
+
 
 @register_protocol("ILLMConnector")
 @runtime_checkable
@@ -44,9 +45,21 @@ class ILLMConnector(Protocol):
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
-        stream: bool = False,
-    ) -> Union[Dict[str, Any], AsyncIterator[str]]:
-        """Chat with LLM. Returns dict if stream=False, AsyncIterator if stream=True"""
+    ) -> Dict[str, Any]:
+        """Non-streaming chat. Returns response dict."""
+        ...
+
+    async def chat_stream(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        file_ids: Optional[List[str]] = None,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> AsyncIterator[str]:
+        """Streaming chat. Yields text chunks."""
         ...
 
     async def upload_file(
@@ -98,6 +111,7 @@ class ILLMConnector(Protocol):
         """Batch chat processing"""
         ...
 
+
 @register_protocol("IQueueConnector")
 @runtime_checkable
 class IQueueConnector(Protocol):
@@ -141,7 +155,7 @@ class IQueueConnector(Protocol):
     async def batch_publish(
         self,
         topic: str,
-        messages: List[tuple],  # (datagram_id, data, key, headers) or variations
+        messages: List[tuple],
         default_format: Optional[str] = None,
         **kwargs: Any,
     ) -> None:
@@ -161,12 +175,13 @@ class IQueueConnector(Protocol):
         ...
 
     async def consume(self) -> Dict[str, Any]:
-        """Consume next message - returns dict with 'payload' and metadata"""
+        """Consume next message - returns dict with \'payload\' and metadata"""
         ...
 
     async def commit(self, message: Dict[str, Any], **kwargs: Any) -> None:
         """Commit specific message"""
         ...
+
 
 @register_protocol("IFileStorageConnector")
 @runtime_checkable
@@ -204,10 +219,10 @@ class IFileStorageConnector(Protocol):
         max_retries: int = 0,
         retry_delay: float = 1.0,
         **kwargs: Any,
-    ) -> Union[bytes, AsyncGenerator[bytes, None]]:
+    ) -> Union[bytes, AsyncIterator[bytes]]:
         """
-        Download file (bytes or AsyncGenerator).
-        Returns bytes if use_streaming=False, AsyncGenerator if use_streaming=True
+        Download file.
+        Returns bytes if use_streaming=False, AsyncIterator if use_streaming=True.
         """
         ...
 
@@ -221,6 +236,7 @@ class IFileStorageConnector(Protocol):
     ) -> None:
         """Upload bytes to storage"""
         ...
+
 
 @register_protocol("IDBConnector")
 @runtime_checkable
@@ -247,51 +263,63 @@ class IDBConnector(Protocol):
     def is_healthy(self) -> bool:
         """Get cached health status"""
         ...
-        
-    async def execute_operation(self, operation:str, query: str, *args: Any) -> Any:
-        """Execute raw query and return result"""
+
+    async def load(self, query: str, *args: Any) -> List[Dict[str, Any]]:
+        """Execute SELECT and return list of rows"""
+        ...
+
+    async def load_one(self, query: str, *args: Any) -> Optional[Dict[str, Any]]:
+        """Execute SELECT and return single row"""
+        ...
+
+    async def execute(self, query: str, *args: Any) -> Any:
+        """Execute DML (INSERT/UPDATE/DELETE)"""
         ...
 
     async def get_pool_stats(self) -> Dict[str, Any]:
         """Get connection pool statistics"""
         ...
 
+
 @register_protocol("IHTTPConnector")
 @runtime_checkable
 class IHTTPConnector(Protocol):
     """Protocol for HTTP connectors"""
-    
+
     @property
-    def app(self) -> Any:  # FastAPI app
+    def app(self) -> Any:
         """Get the web application instance"""
         ...
-        
+
     @property
     def name(self) -> str:
         """Connector name identifier"""
         ...
-    
+
     async def initialize(self) -> None:
         """Initialize connector resources"""
         ...
-    
+
     async def shutdown(self) -> None:
         """Cleanup connector resources"""
         ...
-    
+
     async def health_check(self) -> bool:
         """Check connector health"""
         ...
-    
+
     def is_healthy(self) -> bool:
         """Get cached health status"""
         ...
-    
+
+    async def start(self, ip: str, port: int) -> None:
+        """Start HTTP service"""
+        ...
+
     async def health(self) -> Dict[str, Any]:
         """Get health status information"""
         ...
-    
-    async def status(self) -> Dict[str, Any]:
+
+    async def status(self, status: Any) -> Dict[str, Any]:
         """Get current status information"""
         ...
-    
