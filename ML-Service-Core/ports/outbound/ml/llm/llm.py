@@ -4,11 +4,12 @@ LLM Interface - Strategy pattern implementation.
 Uses DTOs from dto.py for type-safe communication.
 """
 
-from typing import Optional, AsyncIterator, List
+from typing import Optional, AsyncIterator, List, Union, BinaryIO
 
 from ports.outbound.ml.llm.dto import (
     ChatRequest,
     ChatResponse,
+    ChatStreamChunk,
     EmbeddingRequest,
     EmbeddingResponse,
     TokenCountResponse,
@@ -59,8 +60,8 @@ class LLMInterface(BaseInterface[ILLMConnector], ILLMConnector):
             },
         )
 
-    async def stream(self, request: ChatRequest) -> AsyncIterator[str]:
-        """Stream chat with observability."""
+    async def stream(self, request: ChatRequest) -> AsyncIterator[ChatStreamChunk]:
+        """Stream chat chunks (text & tool calls) with observability."""
         async for chunk in self._execute_stream_with_tracking(
             "stream",
             self._worker.stream,
@@ -101,7 +102,7 @@ class LLMInterface(BaseInterface[ILLMConnector], ILLMConnector):
 
     async def upload_file(
         self,
-        file_data: bytes,
+        file_data: Union[bytes, BinaryIO, AsyncIterator[bytes]],
         filename: str,
         mime_type: Optional[str] = None,
         timeout: Optional[float] = None,
@@ -117,7 +118,6 @@ class LLMInterface(BaseInterface[ILLMConnector], ILLMConnector):
             metadata={
                 "filename": filename,
                 "mime_type": mime_type,
-                "file_size": len(file_data),
                 "timeout": timeout,
             },
         )

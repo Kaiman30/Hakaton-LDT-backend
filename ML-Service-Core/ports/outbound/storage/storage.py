@@ -58,6 +58,24 @@ class StorageInterface(BaseInterface[IFileStorageConnector], IFileStorageConnect
             },
         )
 
+    async def upload_stream(
+        self,
+        request: UploadRequest,
+        stream: AsyncIterator[bytes],
+    ) -> UploadResponse:
+        """Stream upload for large files with observability."""
+        return await self._execute_with_tracking(
+            "upload_stream",
+            self._worker.upload_stream,
+            request,
+            stream,
+            metadata={
+                "path": request.path,
+                "bucket": request.bucket,
+                "content_type": request.content_type,
+            },
+        )
+
     async def download(self, request: DownloadRequest) -> DownloadResponse:
         """Download with observability."""
         return await self._execute_with_tracking(

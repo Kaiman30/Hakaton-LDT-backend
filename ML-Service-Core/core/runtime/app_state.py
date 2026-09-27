@@ -1,28 +1,43 @@
-# core/runtime/app_state_machine.py
+# core/runtime/service_runtime.py
 """
-AppStateMachine - рантайм приложения.
-Управляет состояниями сервисов через EventBus.
+ServiceRuntime - рантайм ОДНОГО сервиса.
+
+Отвечает за:
+- состояние сервиса (конечный автомат с проверкой переходов);
+- вызов хуков жизненного цикла сервиса (initialize / shutdown / check_health);
+- API для общения с шиной: все события рантайма публикуются с source=<имя сервиса>.
+
+Не знает про DI-контейнер, фабрики и конфиги: получает готовый объект сервиса.
+Несколько сервисов объединяются в Pipeline (core/runtime/pipeline.py).
+
+Пример:
+    bus = get_event_bus()
+    iface = factory.register_service(
+        "llm", "openai", "llm_interface",
+        interface_kwargs={"event_bus": bus.scoped("llm")},  # события интерфейса тоже с source="llm"
+    )
+    runtime = ServiceRuntime("llm", iface, bus)
+    await runtime.start()
 """
+
+from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Optional, Dict, List
+from typing import Any, Callable, Dict, FrozenSet, Optional, Tuple, Union
 
-from core.di.service_container import Container
-from core.di.factories import ServiceFactory
-from core.runtime.event_bus import get_event_bus, EventType
-
-
-class AppState(str, Enum):
-    """Состояние приложения."""
-    UNINITIALIZED = "uninitialized"
-    INITIALIZING = "initializing"
-    RUNNING = "running"
-    STOPPING = "stopping"
-    STOPPED = "stopped"
-    ERROR = "error"
+from core.runtime.event_bus import (
+    EventCallback,
+    EventType,
+    Payload,
+    RuntimeEventBus,
+    ScopedEventBus,
+    get_event_bus,
+)
 
 
 class ServiceState(str, Enum):
@@ -36,331 +51,291 @@ class ServiceState(str, Enum):
     ERROR = "error"
 
 
-class AppStateMachine:
-    """
-    AppStateMachine - рантайм приложения.
-    
-    Отвечает за:
-    - Загрузку и валидацию конфигов
-    - Прокидывание конфигов в DI
-    - Управление состояниями сервисов
-    - Публикацию событий в EventBus (observability)
-    """
-    
-    def __init__(self, container: Container):
-        self._container = container
-        self._factory = ServiceFactory(container)
-        self._event_bus = get_event_bus()
-        self._logger = logging.getLogger(__name__)
-        
-        # Состояние приложения
-        self._app_state = AppState.UNINITIALIZED
-        self._services: Dict[str, Any] = {}  # name -> service (interface or custom)
-        self._service_states: Dict[str, ServiceState] = {}
-        self._service_health: Dict[str, bool] = {}
-        self._start_time: Optional[datetime] = None
-        self._stop_time: Optional[datetime] = None
-    
-    # ==================== КОНФИГИ ====================
-    
-    def load_config(self, config_path: str, schema: type) -> dict:
-        """
-        Загрузить и валидировать конфиг.
-        
-        Args:
-            config_path: Путь к конфигу
-            schema: Pydantic схема для валидации
-            
-        Returns:
-            Валидированный конфиг
-        """
-        # Загрузка из файла (.env, .json, .yaml)
-        raw_config = self._load_from_file(config_path)
-        
-        # Валидация через Pydantic
-        validated = schema(**raw_config)
-        
-        # Сохраняем в контейнер
-        config_name = schema.__name__.replace("Config", "").lower()
-        self._container.register(f"{config_name}_config", validated)
-        
-        self._logger.info(f"Loaded config: {config_name}")
-        return validated
-    
-    def _load_from_file(self, path: str) -> dict:
-        """Загрузка конфига из файла."""
-        # Реализация загрузки из .env, .json, .yaml
-        if path.endswith('.json'):
-            import json
-            with open(path) as f:
-                return json.load(f)
-        elif path.endswith('.env'):
-            # Загрузка .env через python-dotenv
-            from dotenv import dotenv_values
-            return dotenv_values(path)
-        else:
-            raise ValueError(f"Unsupported config format: {path}")
-    
-    # ==================== РЕГИСТРАЦИЯ СЕРВИСОВ ====================
-    
-    def register_service(
+# Допустимые переходы. Всё, чего здесь нет, - ошибка программиста.
+_TRANSITIONS: Dict[ServiceState, FrozenSet[ServiceState]] = {
+    ServiceState.UNINITIALIZED: frozenset({ServiceState.INITIALIZING}),
+    ServiceState.INITIALIZING: frozenset({ServiceState.RUNNING, ServiceState.ERROR}),
+    ServiceState.RUNNING: frozenset({ServiceState.DEGRADED, ServiceState.STOPPING}),
+    ServiceState.DEGRADED: frozenset({ServiceState.RUNNING, ServiceState.STOPPING}),
+    ServiceState.STOPPING: frozenset({ServiceState.STOPPED, ServiceState.ERROR}),
+    ServiceState.STOPPED: frozenset({ServiceState.INITIALIZING}),          # перезапуск
+    ServiceState.ERROR: frozenset({ServiceState.INITIALIZING,              # повторная попытка
+                                   ServiceState.STOPPING}),                # очистка ресурсов
+}
+
+_HEALTH_HOOKS = ("check_health", "health_check")
+
+
+class InvalidTransitionError(RuntimeError):
+    """Недопустимый переход между состояниями сервиса."""
+
+
+class ServiceRuntime:
+    """Рантайм одного сервиса: состояние + жизненный цикл + API к шине."""
+
+    def __init__(
         self,
         name: str,
-        connector_name: str,
-        interface_name: str,
-        connector_kwargs: dict = None,
-        interface_kwargs: dict = None
+        service: Any,
+        event_bus: Optional[RuntimeEventBus] = None,
     ) -> None:
         """
-        Зарегистрировать сервис (коннектор + интерфейс из SDK).
-        """
-        connector_kwargs = connector_kwargs or {}
-        interface_kwargs = interface_kwargs or {}
-        
-        # Добавляем event_bus для observability
-        if 'event_bus' not in interface_kwargs:
-            interface_kwargs['event_bus'] = self._event_bus
-        
-        # Создаем через фабрику
-        interface = self._factory.register_service(
-            name=name,
-            connector_name=connector_name,
-            interface_name=interface_name,
-            connector_kwargs=connector_kwargs,
-            interface_kwargs=interface_kwargs
-        )
-        
-        self._services[name] = interface
-        self._service_states[name] = ServiceState.UNINITIALIZED
-        self._service_health[name] = False
-        
-        self._logger.info(f"Registered service: {name} ({interface_name}/{connector_name})")
-    
-    def register_custom_service(self, name: str, service_instance: Any) -> None:
-        """
-        Зарегистрировать кастомный сервис разработчика.
-        
         Args:
-            name: Имя сервиса
-            service_instance: Инстанс сервиса
+            name: Имя сервиса (используется как source событий)
+            service: Готовый объект сервиса. Необязательные хуки (sync или async):
+                     initialize(), shutdown(), check_health() / health_check()
+            event_bus: Шина; по умолчанию глобальная
         """
-        self._container.register(name, service_instance)
-        self._services[name] = service_instance
-        self._service_states[name] = ServiceState.UNINITIALIZED
-        self._service_health[name] = False
-        
-        self._logger.info(f"Registered custom service: {name}")
-    
-    # ==================== ЖИЗНЕННЫЙ ЦИКЛ ====================
-    
-    async def initialize(self, timeout: float = 30.0) -> bool:
-        """
-        Инициализировать все сервисы.
-        """
-        if self._app_state != AppState.UNINITIALIZED:
-            return False
-        
-        self._app_state = AppState.INITIALIZING
-        self._start_time = datetime.now()
-        
-        await self._event_bus.publish(
-            EventType.CONNECTOR_INITIALIZED,
-            {"app_state": "initializing"}
-        )
-        
-        results = {}
-        tasks = {}
-        
-        for name, service in self._services.items():
-            self._service_states[name] = ServiceState.INITIALIZING
-            tasks[name] = asyncio.create_task(
-                self._initialize_one(name, service, timeout)
-            )
-        
-        for name, task in tasks.items():
-            try:
-                success = await task
-                results[name] = success
-                self._service_states[name] = (
-                    ServiceState.RUNNING if success else ServiceState.ERROR
-                )
-                self._service_health[name] = success
-            except Exception as e:
-                self._logger.error(f"Error initializing {name}: {e}")
-                results[name] = False
-                self._service_states[name] = ServiceState.ERROR
-        
-        success = all(results.values())
-        self._app_state = AppState.RUNNING if success else AppState.ERROR
-        
-        await self._event_bus.publish(
-            EventType.CONNECTOR_INITIALIZED,
-            {"app_state": self._app_state.value, "results": results}
-        )
-        
-        return success
-    
-    async def _initialize_one(self, name: str, service: Any, timeout: float) -> bool:
-        """Инициализировать один сервис."""
-        try:
-            if hasattr(service, 'initialize'):
-                await asyncio.wait_for(service.initialize(), timeout=timeout)
-            self._logger.info(f"Initialized: {name}")
-            return True
-        except asyncio.TimeoutError:
-            self._logger.error(f"Timeout initializing {name}")
-            return False
-        except Exception as e:
-            self._logger.error(f"Error initializing {name}: {e}")
-            return False
-    
-    async def start(self, timeout: float = 30.0) -> bool:
-        """
-        Запустить все сервисы.
-        """
-        if self._app_state == AppState.RUNNING:
-            return True
-        
-        if self._app_state == AppState.UNINITIALIZED:
-            if not await self.initialize(timeout):
-                return False
-        
-        self._app_state = AppState.RUNNING
-        
-        await self._event_bus.publish(
-            EventType.CONNECTOR_INITIALIZED,
-            {"app_state": "running"}
-        )
-        
-        self._logger.info("Application started")
-        return True
-    
-    async def stop(self, timeout: float = 10.0) -> bool:
-        """
-        Остановить все сервисы.
-        """
-        if self._app_state in (AppState.STOPPED, AppState.UNINITIALIZED):
-            return True
-        
-        self._app_state = AppState.STOPPING
-        self._stop_time = datetime.now()
-        
-        await self._event_bus.publish(
-            EventType.CONNECTOR_SHUTDOWN,
-            {"app_state": "stopping"}
-        )
-        
-        results = {}
-        for name, service in self._services.items():
-            self._service_states[name] = ServiceState.STOPPING
-            try:
-                if hasattr(service, 'shutdown'):
-                    await asyncio.wait_for(service.shutdown(), timeout=timeout)
-                self._service_states[name] = ServiceState.STOPPED
-                results[name] = True
-                self._logger.info(f"Stopped: {name}")
-            except asyncio.TimeoutError:
-                self._logger.error(f"Timeout stopping {name}")
-                results[name] = False
-                self._service_states[name] = ServiceState.ERROR
-            except Exception as e:
-                self._logger.error(f"Error stopping {name}: {e}")
-                results[name] = False
-                self._service_states[name] = ServiceState.ERROR
-        
-        self._app_state = AppState.STOPPED
-        
-        await self._event_bus.publish(
-            EventType.CONNECTOR_SHUTDOWN,
-            {"app_state": "stopped", "results": results}
-        )
-        
-        return all(results.values())
-    
-    async def health_check(self) -> Dict[str, bool]:
-        """
-        Проверить здоровье всех сервисов.
-        """
-        results = {}
-        
-        for name, service in self._services.items():
-            try:
-                if hasattr(service, 'check_health'):
-                    healthy = await service.check_health()
-                elif hasattr(service, 'health_check'):
-                    healthy = await service.health_check()
-                else:
-                    healthy = True
-                
-                results[name] = healthy
-                self._service_health[name] = healthy
-                
-                if not healthy:
-                    self._logger.warning(f"Service {name} is unhealthy")
-                
-            except Exception as e:
-                self._logger.error(f"Health check failed for {name}: {e}")
-                results[name] = False
-                self._service_health[name] = False
-        
-        return results
-    
-    # ==================== ПОЛУЧЕНИЕ СЕРВИСОВ ====================
-    
-    def get_service(self, name: str) -> Optional[Any]:
-        """Получить сервис по имени."""
-        return self._services.get(name)
-    
-    def get_llm(self, name: str = "llm") -> Optional[Any]:
-        return self._services.get(name)
-    
-    def get_storage(self, name: str = "storage") -> Optional[Any]:
-        return self._services.get(name)
-    
-    def get_queue(self, name: str = "queue") -> Optional[Any]:
-        return self._services.get(name)
-    
-    def get_db(self, name: str = "db") -> Optional[Any]:
-        return self._services.get(name)
-    
-    def get_http(self, name: str = "http") -> Optional[Any]:
-        return self._services.get(name)
-    
-    def list_services(self) -> List[str]:
-        return list(self._services.keys())
-    
-    # ==================== СОСТОЯНИЕ ====================
-    
-    def get_state(self) -> Dict[str, Any]:
-        """Получить состояние приложения."""
-        return {
-            "app_state": self._app_state.value,
-            "start_time": self._start_time.isoformat() if self._start_time else None,
-            "stop_time": self._stop_time.isoformat() if self._stop_time else None,
-            "uptime": (datetime.now() - self._start_time).total_seconds() if self._start_time else 0,
-            "services": self.get_services_state()
-        }
-    
-    def get_services_state(self) -> Dict[str, Dict[str, Any]]:
-        """Получить состояние всех сервисов."""
-        return {
-            name: {
-                "state": self._service_states.get(name, ServiceState.UNINITIALIZED).value,
-                "healthy": self._service_health.get(name, False)
-            }
-            for name in self._services.keys()
-        }
-    
-    def get_service_state(self, name: str) -> Optional[Dict[str, Any]]:
-        """Получить состояние конкретного сервиса."""
-        if name not in self._services:
-            return None
-        
-        return {
-            "state": self._service_states.get(name, ServiceState.UNINITIALIZED).value,
-            "healthy": self._service_health.get(name, False)
-        }
-    
+        if not name:
+            raise ValueError("ServiceRuntime requires a non-empty name")
+
+        self._name = name
+        self._service = service
+        self._bus = event_bus or get_event_bus()
+        self._events: ScopedEventBus = self._bus.scoped(name)
+        self._logger = logging.getLogger(f"{__name__}.{name}")
+
+        self._state = ServiceState.UNINITIALIZED
+        self._last_error: Optional[str] = None
+        self._started_at: Optional[datetime] = None
+        self._stopped_at: Optional[datetime] = None
+        self._t_started: Optional[float] = None  # monotonic
+        self._t_stopped: Optional[float] = None  # monotonic
+
+        # Lock создаётся лениво: на Python < 3.10 asyncio.Lock привязывается к циклу
+        # в момент создания, а рантайм могут создать до asyncio.run().
+        self._lock: Optional[asyncio.Lock] = None
+
+    # ==================== СВОЙСТВА ====================
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def service(self) -> Any:
+        return self._service
+
+    @property
+    def state(self) -> ServiceState:
+        return self._state
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self._last_error
+
     @property
     def is_running(self) -> bool:
-        return self._app_state == AppState.RUNNING
+        """Сервис поднят (RUNNING или DEGRADED)."""
+        return self._state in (ServiceState.RUNNING, ServiceState.DEGRADED)
+
+    @property
+    def is_healthy(self) -> bool:
+        """Сервис поднят и последняя проверка здоровья успешна."""
+        return self._state is ServiceState.RUNNING
+
+    @property
+    def events(self) -> ScopedEventBus:
+        """Шина, привязанная к этому сервису (source=name)."""
+        return self._events
+
+    # ==================== API ШИНЫ ====================
+
+    async def publish(self, event_type: Union[str, Enum], payload: Optional[Payload] = None) -> None:
+        """Опубликовать событие от имени этого сервиса."""
+        await self._events.publish(event_type, payload)
+
+    def subscribe(self, event_type: Union[str, Enum], callback: EventCallback) -> None:
+        """Подписаться на события ТОЛЬКО этого сервиса."""
+        self._events.subscribe(event_type, callback)
+
+    def unsubscribe(self, event_type: Union[str, Enum], callback: EventCallback) -> None:
+        self._events.unsubscribe(event_type, callback)
+
+    # ==================== ЖИЗНЕННЫЙ ЦИКЛ ====================
+
+    async def start(self, timeout: Optional[float] = 30.0) -> bool:
+        """
+        Поднять сервис (хук initialize()).
+
+        Идемпотентно: если сервис уже поднят - True. Из ERROR и STOPPED
+        можно запустить повторно. Параллельные вызовы сериализуются.
+
+        Returns:
+            True, если сервис в RUNNING/DEGRADED
+        """
+        async with self._get_lock():
+            if self.is_running:
+                return True
+
+            await self._transition(ServiceState.INITIALIZING)
+            try:
+                ok, _, error = await self._call_hook("initialize", timeout)
+            except asyncio.CancelledError:
+                await self._transition(ServiceState.ERROR, "cancelled during initialize")
+                raise
+
+            if ok:
+                await self._transition(ServiceState.RUNNING)
+            else:
+                await self._transition(ServiceState.ERROR, error)
+            return ok
+
+    async def stop(self, timeout: Optional[float] = 10.0) -> bool:
+        """
+        Остановить сервис (хук shutdown()).
+
+        Идемпотентно: для UNINITIALIZED/STOPPED - True. Из ERROR вызывается
+        для очистки ресурсов после неудачного запуска.
+
+        Returns:
+            True, если сервис остановлен
+        """
+        async with self._get_lock():
+            if self._state in (ServiceState.UNINITIALIZED, ServiceState.STOPPED):
+                return True
+
+            await self._transition(ServiceState.STOPPING)
+            try:
+                ok, _, error = await self._call_hook("shutdown", timeout)
+            except asyncio.CancelledError:
+                await self._transition(ServiceState.ERROR, "cancelled during shutdown")
+                raise
+
+            if ok:
+                await self._transition(ServiceState.STOPPED)
+            else:
+                await self._transition(ServiceState.ERROR, error)
+            return ok
+
+    async def check_health(self, timeout: Optional[float] = 5.0) -> bool:
+        """
+        Проверить здоровье сервиса (вызов метода check_health()).
+
+        Для незапущенного сервиса возвращает False без публикации событий.
+        Состояние RUNNING <-> DEGRADED переключается по результату.
+        """
+        if not self.is_running:
+            return False
+
+        error: Optional[str] = None
+        hook = getattr(self._service, "check_health", None)
+
+        if not callable(hook):
+            healthy = True
+        else:
+            ok, result, error = await self._call_hook("check_health", timeout)
+            healthy = ok and bool(result)
+            if ok and not healthy:
+                error = "check_health() reported unhealthy"
+
+        if self._state is ServiceState.RUNNING and not healthy:
+            await self._transition(ServiceState.DEGRADED, error)
+        elif self._state is ServiceState.DEGRADED and healthy:
+            await self._transition(ServiceState.RUNNING)
+
+        if not healthy:
+            self._logger.warning("Service %s is unhealthy: %s", self._name, error)
+
+        await self._events.publish(
+            EventType.HEALTH_CHECK,
+            {"service": self._name, "healthy": healthy, "error": error},
+        )
+        return healthy
+
+    # ==================== СОСТОЯНИЕ ====================
+
+    def get_state(self) -> Dict[str, Any]:
+        """Снимок состояния сервиса."""
+        if self._t_started is None:
+            uptime = 0.0
+        else:
+            end = self._t_stopped if self._t_stopped is not None else time.monotonic()
+            uptime = end - self._t_started
+
+        return {
+            "name": self._name,
+            "state": self._state.value,
+            "healthy": self.is_healthy,
+            "last_error": self._last_error,
+            "started_at": self._started_at.isoformat() if self._started_at else None,
+            "stopped_at": self._stopped_at.isoformat() if self._stopped_at else None,
+            "uptime": uptime,
+        }
+
+    # ==================== ВНУТРЕННЕЕ ====================
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def _set_state(self, new: ServiceState, error: Optional[str] = None) -> None:
+        """Синхронно сменить состояние с проверкой перехода и обновить метки времени."""
+        old = self._state
+        if new not in _TRANSITIONS[old]:
+            raise InvalidTransitionError(
+                f"Service '{self._name}': {old.value} -> {new.value} is not allowed"
+            )
+
+        now = datetime.now(timezone.utc)
+        self._state = new
+        self._last_error = error  # причина текущего состояния; None очищает
+
+        if new is ServiceState.INITIALIZING:
+            self._started_at = self._stopped_at = None
+            self._t_started = self._t_stopped = None
+        elif new is ServiceState.RUNNING and old is ServiceState.INITIALIZING:
+            # RUNNING <-> DEGRADED аптайм не сбрасывает
+            self._started_at = now
+            self._t_started = time.monotonic()
+        elif new is ServiceState.STOPPING:
+            self._stopped_at = now
+            self._t_stopped = time.monotonic()
+
+    async def _transition(self, new: ServiceState, error: Optional[str] = None) -> None:
+        """Сменить состояние и опубликовать событие. Состояние меняется до публикации."""
+        old = self._state
+        self._set_state(new, error)
+
+        if new is ServiceState.ERROR:
+            self._logger.error("%s: %s -> %s (%s)", self._name, old.value, new.value, error)
+        else:
+            self._logger.info("%s: %s -> %s", self._name, old.value, new.value)
+
+        await self._events.publish(
+            EventType.SERVICE_STATE_CHANGED,
+            {
+                "service": self._name,
+                "from": old.value,
+                "to": new.value,
+                "error": self._last_error,
+            },
+        )
+
+    async def _call_hook(
+        self, hook_name: str, timeout: Optional[float]
+    ) -> Tuple[bool, Any, Optional[str]]:
+        """
+        Вызвать хук сервиса (sync или async) с таймаутом.
+
+        Returns:
+            (успех, результат хука, текст ошибки). Отсутствующий хук - успех.
+            Исключение наружу не выходит (кроме CancelledError).
+        """
+        hook: Optional[Callable[[], Any]] = getattr(self._service, hook_name, None)
+        if not callable(hook):
+            return True, None, None
+
+        try:
+            result = hook()
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, timeout)
+            return True, result, None
+        except asyncio.TimeoutError:
+            message = f"{hook_name}() timed out after {timeout}s"
+            self._logger.error("%s: %s", self._name, message)
+            return False, None, message
+        except Exception as e:
+            self._logger.exception("%s: %s() failed", self._name, hook_name)
+            return False, None, f"{type(e).__name__}: {e}"

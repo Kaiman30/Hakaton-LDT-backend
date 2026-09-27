@@ -1,15 +1,15 @@
 # infrastructure/internal/logging.py
+from __future__ import annotations
+
 import asyncio
 import logging
-import inspect
+from datetime import datetime, timezone
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from typing import Optional, Dict, Any, List
 import asyncpg
-import queue
-import threading
-import time
-from datetime import datetime
+
+from core.base_class.lifecycle import Lifecycle
 
 
 class ColoredFormatter(logging.Formatter):
@@ -22,52 +22,90 @@ class ColoredFormatter(logging.Formatter):
     }
     RESET = '\033[0m'
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         log_color = self.COLORS.get(record.levelname, self.RESET)
-        location = f"{record.filename}:{record.lineno} in {record.funcName}"
-        record.location = location
+        record.location = f"{record.filename}:{record.lineno} in {record.funcName}"
         record.levelname = f"{log_color}{record.levelname}{self.RESET}"
         return super().format(record)
 
 
-class AsyncPGHandler(logging.Handler):
-    """Asynchronous PostgreSQL logging handler with graceful shutdown."""
+class AsyncPGHandler(logging.Handler, Lifecycle):
+    """
+    Асинхронный PostgreSQL хэндлер логирования.
+    Реализует протокол Lifecycle для интеграции с DI-контейнером.
+    """
 
     def __init__(self, dsn: str, table: str = 'logs', max_queue_size: int = 1000):
         super().__init__()
-        self.dsn = dsn
-        self.table = table
-        self.max_queue_size = max_queue_size
-        self.log_queue = queue.Queue(maxsize=max_queue_size)
-        self._stop_event = threading.Event()
-        self._running = True
+        self._dsn = dsn
+        self._table = table
+        self._max_queue_size = max_queue_size
         
-        # Start background thread
-        self.worker_thread = threading.Thread(target=self._process_logs, daemon=True)
-        self.worker_thread.start()
-        
-        # Initialize connection pool
-        self.pool = None
-        asyncio.run(self._initialize_pool())
+        self._pool: Optional[asyncpg.Pool] = None
+        self._queue: Optional[asyncio.Queue] = None
+        self._worker_task: Optional[asyncio.Task] = None
+        self._healthy: bool = False
+        self._name: str = "asyncpg_logger"
 
-    async def _initialize_pool(self):
-        """Initialize the connection pool asynchronously."""
-        self.pool = await asyncpg.create_pool(
-            self.dsn,
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def healthy(self) -> bool:
+        return self._healthy
+
+    async def initialize(self) -> None:
+        """Инициализация пула соединений и запуск фоновой задачи очереди."""
+        if self._pool is not None:
+            return
+
+        self._queue = asyncio.Queue(maxsize=self._max_queue_size)
+        self._pool = await asyncpg.create_pool(
+            self._dsn,
             min_size=1,
             max_size=5,
             command_timeout=60
         )
         await self._create_table_if_not_exists()
+        self._worker_task = asyncio.create_task(self._process_logs())
+        self._healthy = True
 
-    async def _create_table_if_not_exists(self):
-        """Create logs table if it doesn't exist."""
-        if not self.pool:
+    async def shutdown(self) -> None:
+        """Graceful shutdown: сброс остатков очереди и закрытие пула."""
+        self._healthy = False
+
+        if self._worker_task and not self._worker_task.done():
+            self._worker_task.cancel()
+            try:
+                await self._worker_task
+            except asyncio.CancelledError:
+                pass
+
+        # Сбрасываем оставшиеся записи из очереди
+        await self._flush_remaining()
+
+        if self._pool:
+            await self._pool.close()
+            self._pool = None
+
+    async def check_health(self) -> bool:
+        if not self._pool or not self._healthy:
+            return False
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception:
+            self._healthy = False
+            return False
+
+    async def _create_table_if_not_exists(self) -> None:
+        if not self._pool:
             return
-            
-        async with self.pool.acquire() as conn:
+        async with self._pool.acquire() as conn:
             await conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self.table} (
+            CREATE TABLE IF NOT EXISTS {self._table} (
                 id SERIAL PRIMARY KEY,
                 created_at TIMESTAMPTZ DEFAULT NOW(),
                 level VARCHAR(10) NOT NULL,
@@ -79,155 +117,106 @@ class AsyncPGHandler(logging.Handler):
             );
             """)
 
-    def emit(self, record):
-        """Add log record to queue for async processing."""
+    def emit(self, record: logging.LogRecord) -> None:
+        """Поместить запись в неблокирующую асинхронную очередь."""
+        if not self._healthy or self._queue is None:
+            return
+
         try:
-            formatted_msg = self.format(record)
-            
             log_entry = {
-                'created_at': datetime.utcnow(),
+                'created_at': datetime.now(timezone.utc),
                 'level': record.levelname,
                 'logger_name': record.name,
                 'file_name': record.filename,
                 'line_number': record.lineno,
                 'function_name': record.funcName,
-                'message': formatted_msg
+                'message': self.format(record)
             }
             
             try:
-                self.log_queue.put_nowait(log_entry)
-            except queue.Full:
+                self._queue.put_nowait(log_entry)
+            except asyncio.QueueFull:
+                # В случае переполнения выбиваем самый старый лог
                 try:
-                    self.log_queue.get_nowait()
-                    self.log_queue.put_nowait(log_entry)
-                except queue.Empty:
+                    self._queue.get_nowait()
+                    self._queue.put_nowait(log_entry)
+                except asyncio.QueueEmpty:
                     pass
         except Exception:
             self.handleError(record)
 
-    def _process_logs(self):
-        """Background thread function to process logs from queue."""
-        while self._running and not self._stop_event.is_set():
+    async def _process_logs(self) -> None:
+        """Фоновый воркер пачечной вставки логов."""
+        while True:
+            batch: List[dict] = []
             try:
-                batch = []
-                batch_start_time = time.time()
-                
-                # Collect logs for batching
-                while len(batch) < 100 and (time.time() - batch_start_time) < 1.0:
-                    try:
-                        log_entry = self.log_queue.get(timeout=0.1)
-                        batch.append(log_entry)
-                    except queue.Empty:
-                        # Check if we should stop
-                        if self._stop_event.is_set():
-                            break
-                        continue
-                
+                # Ждем первый элемент
+                entry = await self._queue.get()
+                batch.append(entry)
+                self._queue.task_done()
+
+                # Собираем остальные доступные элементы до лимита 100 шт
+                while len(batch) < 100 and not self._queue.empty():
+                    entry = self._queue.get_nowait()
+                    batch.append(entry)
+                    self._queue.task_done()
+
                 if batch:
-                    # Check if we should stop before processing batch
-                    if self._stop_event.is_set():
-                        # Process remaining logs one more time
-                        self._flush_remaining()
-                        break
-                    
-                    asyncio.run(self._insert_batch_async(batch))
-                    
-            except Exception as e:
-                print(f"Error in AsyncPGHandler worker: {e}")
-                if not self._stop_event.is_set():
-                    time.sleep(0.1)  # Prevent busy loop on error
+                    await self._insert_batch(batch)
 
-    def _flush_remaining(self):
-        """Flush remaining logs in queue."""
-        remaining = []
-        while not self.log_queue.empty():
-            try:
-                remaining.append(self.log_queue.get_nowait())
-            except queue.Empty:
+            except asyncio.CancelledError:
                 break
-        
-        if remaining:
-            try:
-                asyncio.run(self._insert_batch_async(remaining))
             except Exception as e:
-                print(f"Error flushing remaining logs: {e}")
+                # В случае ошибки логгера печатаем в stderr, чтобы не уйти в бесконечную рекурсию
+                print(f"Error in AsyncPGHandler worker: {e}")
+                await asyncio.sleep(0.5)
 
-    async def _insert_batch_async(self, batch: List[dict]):
-        """Insert a batch of log records into the database."""
-        if not self.pool:
+    async def _insert_batch(self, batch: List[dict]) -> None:
+        if not self._pool:
             return
-            
         try:
-            async with self.pool.acquire() as conn:
+            async with self._pool.acquire() as conn:
                 query = f"""
-                INSERT INTO {self.table}
+                INSERT INTO {self._table}
                 (created_at, level, logger_name, file_name, line_number, function_name, message)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 """
-                
                 values = [
                     (
-                        entry['created_at'],
-                        entry['level'],
-                        entry['logger_name'],
-                        entry['file_name'],
-                        entry['line_number'],
-                        entry['function_name'],
-                        entry['message']
+                        e['created_at'], e['level'], e['logger_name'],
+                        e['file_name'], e['line_number'], e['function_name'], e['message']
                     )
-                    for entry in batch
+                    for e in batch
                 ]
-                
                 await conn.executemany(query, values)
-                
         except Exception as e:
-            print(f"Error inserting logs to database: {e}")
-            # Re-queue failed logs
-            for entry in batch:
-                try:
-                    self.log_queue.put_nowait(entry)
-                except queue.Full:
-                    pass
+            print(f"Error inserting logs to Postgres: {e}")
 
-    async def close_async(self):
-        """Gracefully close the handler."""
-        self._stop_event.set()
-        self._running = False
-        
-        # Wait for worker thread to finish
-        if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5.0)
-        
-        # Close connection pool
-        if self.pool:
-            await self.pool.close()
-            await self.pool.wait_closed()
-        
-        super().close()
-
-    def close(self):
-        """Close the handler (synchronous wrapper)."""
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(self.close_async())
-            else:
-                loop.run_until_complete(self.close_async())
-        except RuntimeError:
-            # No event loop running, create one
-            asyncio.run(self.close_async())
+    async def _flush_remaining(self) -> None:
+        if not self._queue or self._queue.empty():
+            return
+        remaining: List[dict] = []
+        while not self._queue.empty():
+            remaining.append(self._queue.get_nowait())
+            self._queue.task_done()
+        if remaining:
+            await self._insert_batch(remaining)
 
 
 def setup_logger(
-        version: str,
-        name: str = 'GUI',
-        log_file: str = None,
-        level: int = logging.INFO,
-        pg_dsn: str = None
-) -> logging.Logger:
+    version: str,
+    name: str = 'GUI',
+    log_file: Optional[str] = None,
+    level: int = logging.INFO,
+    pg_dsn: Optional[str] = None
+) -> tuple[logging.Logger, Optional[AsyncPGHandler]]:
+    """
+    Создает логгер. Возвращает (logger, pg_handler).
+    pg_handler регистрируется в DI-контейнере как Lifecycle компонент.
+    """
     logger = logging.getLogger(name)
     if logger.hasHandlers():
-        return logger
+        return logger, None
 
     file_formatter = logging.Formatter(
         f'{version} - %(location)s - %(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -255,51 +244,10 @@ def setup_logger(
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
+    pg_handler: Optional[AsyncPGHandler] = None
     if pg_dsn:
         pg_handler = AsyncPGHandler(pg_dsn)
         pg_handler.setFormatter(file_formatter)
         logger.addHandler(pg_handler)
 
-    return logger
-
-
-def get_logger(
-    version: str = "1.0.0",
-    name: str = "gigachatAPI",
-    log_file: Optional[str] = None,
-    level: Optional[int] = None,
-    pg_dsn: Optional[str] = None,
-    enable_debug: bool = False,
-) -> logging.Logger:
-    """Get configured logger instance."""
-    if log_file is None:
-        log_file = "logs/system.log"
-
-    if level is None:
-        level = logging.DEBUG if enable_debug else logging.INFO
-
-    return setup_logger(version, name, log_file, level=level, pg_dsn=pg_dsn)
-
-
-def get_logger_from_config(config) -> logging.Logger:
-    """Get logger configured from Config object."""
-    level_map = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL,
-    }
-
-    level = level_map.get(config.log_level, logging.INFO)
-    if config.log_enable_debug:
-        level = logging.DEBUG
-
-    return get_logger(
-        version="1.0.0",
-        name="gigachatAPI",
-        log_file=config.log_file,
-        level=level,
-        pg_dsn=getattr(config, 'log_pg_dsn', None),
-        enable_debug=config.log_enable_debug,
-    )
+    return logger, pg_handler
