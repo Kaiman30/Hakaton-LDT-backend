@@ -7,7 +7,7 @@ Each protocol uses DTOs from corresponding ports.
 from typing import Protocol, runtime_checkable, AsyncIterator, Optional, List, Dict, Any
 
 from core.base_class.base_protocol import BaseProtocol
-from core.registry import ProtocolRegistry
+from core.registry.registry import ProtocolRegistry
 
 # Inbound DTOs
 from ports.inbound.broker.dto import (
@@ -21,7 +21,7 @@ from ports.inbound.broker.dto import (
     CommitRequest,
     CommitResponse,
 )
-from ports.inbound.network.dto import HttpRequest, HttpResponse
+from ports.outbound.network.dto import HttpRequest, HttpResponse
 
 # Outbound DTOs
 from ports.outbound.db.dto import (
@@ -55,55 +55,17 @@ from ports.outbound.storage.dto import (
 )
 
 
-# ============================================================================
-# BASE PROTOCOL (унифицирован)
-# ============================================================================
-
-@runtime_checkable
-class BaseProtocolWithHealth(BaseProtocol):
-    """
-    Base protocol with unified lifecycle and health methods.
-    """
-    
-    @property
-    def name(self) -> str:
-        """Connector name identifier."""
-        ...
-    
-    async def initialize(self) -> None:
-        """Initialize connector resources."""
-        ...
-    
-    async def shutdown(self) -> None:
-        """Cleanup connector resources."""
-        ...
-    
-    async def check_health(self) -> bool:
-        """
-        Perform real remote health check.
-        Renamed from health_check() for consistency.
-        """
-        ...
-    
-    @property
-    def healthy(self) -> bool:
-        """
-        Get cached health status.
-        Renamed from is_healthy() for consistency.
-        """
-        ...
-
 
 # ============================================================================
-# OUTBOUND PROTOCOLS (исходящие порты)
+# OUTBOUND PROTOCOLS (чистые бизнес-интерфейсы)
 # ============================================================================
 
 @ProtocolRegistry.register("ILLMConnector")
 @runtime_checkable
-class ILLMConnector(BaseProtocolWithHealth):
+class ILLMConnector(BaseProtocol, Protocol):
     """
-    Protocol for LLM connectors.
-    All methods use DTOs for type-safe communication.
+    Protocol for LLM operations.
+    Focuses exclusively on LLM domain capabilities.
     """
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
@@ -151,11 +113,8 @@ class ILLMConnector(BaseProtocolWithHealth):
 
 @ProtocolRegistry.register("IQueueConnector")
 @runtime_checkable
-class IQueueConnector(BaseProtocolWithHealth):
-    """
-    Protocol for queue/broker connectors.
-    All methods use DTOs for type-safe communication.
-    """
+class IQueueConnector(BaseProtocol, Protocol):
+    """Protocol for queue/broker operations."""
 
     async def publish(self, request: PublishRequest) -> PublishResponse:
         """Publish a single message."""
@@ -180,11 +139,8 @@ class IQueueConnector(BaseProtocolWithHealth):
 
 @ProtocolRegistry.register("IFileStorageConnector")
 @runtime_checkable
-class IFileStorageConnector(BaseProtocolWithHealth):
-    """
-    Protocol for file/blob storage connectors.
-    All methods use DTOs for type-safe communication.
-    """
+class IFileStorageConnector(BaseProtocol, Protocol):
+    """Protocol for file/blob storage operations."""
 
     async def upload(self, request: UploadRequest) -> UploadResponse:
         """Upload a file."""
@@ -209,11 +165,8 @@ class IFileStorageConnector(BaseProtocolWithHealth):
 
 @ProtocolRegistry.register("IDBConnector")
 @runtime_checkable
-class IDBConnector(BaseProtocolWithHealth):
-    """
-    Protocol for database connectors.
-    All methods use DTOs for type-safe communication.
-    """
+class IDBConnector(BaseProtocol, Protocol):
+    """Protocol for database operations."""
 
     async def query(self, request: QueryRequest) -> QueryResponse:
         """Execute a SELECT query."""
@@ -234,11 +187,8 @@ class IDBConnector(BaseProtocolWithHealth):
 
 @ProtocolRegistry.register("IHTTPConnector")
 @runtime_checkable
-class IHTTPConnector(BaseProtocolWithHealth):
-    """
-    Protocol for HTTP connectors.
-    All methods use DTOs for type-safe communication.
-    """
+class IHTTPConnector(BaseProtocol, Protocol):
+    """Protocol for HTTP client operations."""
 
     async def request(self, request: HttpRequest) -> HttpResponse:
         """Execute an HTTP request."""

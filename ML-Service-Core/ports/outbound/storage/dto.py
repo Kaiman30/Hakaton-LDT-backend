@@ -1,13 +1,13 @@
 # ports/outbound/storage/dto.py
 """
-Data Transfer Objects for storage communication with Pydantic validation.
+Data Transfer Objects for Outbound Storage communication with Pydantic v2 validation.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, BinaryIO, Dict, List, Optional, Union
-from pydantic import BaseModel, Field, validator
+from typing import Any, BinaryIO, Dict, List, Optional, Union, AsyncIterator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class StorageObjectType(str, Enum):
@@ -28,36 +28,32 @@ class StorageObjectModel(BaseModel):
     etag: Optional[str] = None
     content_type: Optional[str] = None
     metadata: Dict[str, str] = Field(default_factory=dict)
-    
-    @validator('path')
-    def path_not_empty(cls, v):
+
+    @field_validator('path')
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError('Path cannot be empty')
-        return v
+        return v.strip()
 
 
 class UploadRequestModel(BaseModel):
     """Pydantic model for UploadRequest validation."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     path: str = Field(..., min_length=1)
-    data: Union[bytes, BinaryIO, str]  # Can't fully validate BinaryIO
+    data: Union[bytes, BinaryIO, str, AsyncIterator[bytes]]
     content_type: Optional[str] = None
     metadata: Dict[str, str] = Field(default_factory=dict)
     bucket: Optional[str] = Field(None, min_length=1)
-    part_size: Optional[int] = Field(None, gt=0, le=1024*1024*100)  # Max 100MB per part
-    
-    @validator('path')
-    def path_not_empty(cls, v):
+    part_size: Optional[int] = Field(None, gt=0, le=1024 * 1024 * 100)  # Max 100MB
+
+    @field_validator('path')
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError('Path cannot be empty')
-        return v
-    
-    @validator('data')
-    def data_not_empty(cls, v):
-        if isinstance(v, bytes) and len(v) == 0:
-            raise ValueError('Data cannot be empty')
-        if isinstance(v, str) and not v.strip():
-            raise ValueError('Data string cannot be empty')
-        return v
+        return v.strip()
 
 
 class DownloadRequestModel(BaseModel):
@@ -67,27 +63,29 @@ class DownloadRequestModel(BaseModel):
     offset: Optional[int] = Field(None, ge=0)
     length: Optional[int] = Field(None, gt=0)
     version_id: Optional[str] = None
-    
-    @validator('path')
-    def path_not_empty(cls, v):
+
+    @field_validator('path')
+    @classmethod
+    def path_not_empty(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError('Path cannot be empty')
-        return v
+        return v.strip()
 
 
 class DeleteRequestModel(BaseModel):
     """Pydantic model for DeleteRequest validation."""
-    paths: List[str] = Field(..., min_items=1)
+    paths: List[str] = Field(..., min_length=1)
     bucket: Optional[str] = Field(None, min_length=1)
     recursive: bool = False
-    
-    @validator('paths')
-    def paths_not_empty(cls, v):
+
+    @field_validator('paths')
+    @classmethod
+    def paths_not_empty(cls, v: List[str]) -> List[str]:
         if not v:
             raise ValueError('Paths list cannot be empty')
         for path in v:
             if not path or not path.strip():
-                raise ValueError('Path cannot be empty')
+                raise ValueError('Path inside paths list cannot be empty')
         return v
 
 
@@ -114,24 +112,22 @@ class StorageObject:
     etag: Optional[str] = None
     content_type: Optional[str] = None
     metadata: Dict[str, str] = field(default_factory=dict)
-    
-    def __post_init__(self):
-        """Validate after initialization."""
+
+    def __post_init__(self) -> None:
         if not self.path or not self.path.strip():
             raise ValueError('Path cannot be empty')
         if self.size is not None and self.size < 0:
             raise ValueError('Size cannot be negative')
-    
+
     @property
     def is_file(self) -> bool:
         return self.type == StorageObjectType.FILE
-    
+
     @property
     def is_folder(self) -> bool:
         return self.type == StorageObjectType.FOLDER
-    
+
     def validate(self) -> StorageObjectModel:
-        """Validate using Pydantic model."""
         return StorageObjectModel(
             name=self.name,
             path=self.path,
@@ -140,7 +136,7 @@ class StorageObject:
             last_modified=self.last_modified,
             etag=self.etag,
             content_type=self.content_type,
-            metadata=self.metadata
+            metadata=self.metadata,
         )
 
 
@@ -148,32 +144,26 @@ class StorageObject:
 class UploadRequest:
     """Request to upload a file."""
     path: str
-    data: Union[bytes, BinaryIO, str]
+    data: Union[bytes, BinaryIO, str, AsyncIterator[bytes]]
     content_type: Optional[str] = None
     metadata: Dict[str, str] = field(default_factory=dict)
     bucket: Optional[str] = None
     part_size: Optional[int] = None
-    
-    def __post_init__(self):
-        """Validate after initialization."""
+
+    def __post_init__(self) -> None:
         if not self.path or not self.path.strip():
             raise ValueError('Path cannot be empty')
-        if isinstance(self.data, bytes) and len(self.data) == 0:
-            raise ValueError('Data cannot be empty')
-        if isinstance(self.data, str) and not self.data.strip():
-            raise ValueError('Data string cannot be empty')
         if self.part_size is not None and self.part_size <= 0:
             raise ValueError('Part size must be positive')
-    
+
     def validate(self) -> UploadRequestModel:
-        """Validate using Pydantic model."""
         return UploadRequestModel(
             path=self.path,
             data=self.data,
             content_type=self.content_type,
             metadata=self.metadata,
             bucket=self.bucket,
-            part_size=self.part_size
+            part_size=self.part_size,
         )
 
 
@@ -185,8 +175,8 @@ class UploadResponse:
     size: int
     upload_id: Optional[str] = None
     version_id: Optional[str] = None
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if self.size < 0:
             raise ValueError('Size cannot be negative')
 
@@ -199,34 +189,33 @@ class DownloadRequest:
     offset: Optional[int] = None
     length: Optional[int] = None
     version_id: Optional[str] = None
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if not self.path or not self.path.strip():
             raise ValueError('Path cannot be empty')
         if self.offset is not None and self.offset < 0:
             raise ValueError('Offset cannot be negative')
         if self.length is not None and self.length <= 0:
             raise ValueError('Length must be positive')
-    
+
     def validate(self) -> DownloadRequestModel:
-        """Validate using Pydantic model."""
         return DownloadRequestModel(
             path=self.path,
             bucket=self.bucket,
             offset=self.offset,
             length=self.length,
-            version_id=self.version_id
+            version_id=self.version_id,
         )
 
 
 @dataclass
 class DownloadResponse:
-    """Response from downloading."""
-    data: bytes
+    """Response from downloading (for small objects or metadata)."""
     content_type: str
     size: int
     last_modified: datetime
     etag: str
+    data: Optional[bytes] = None
 
 
 @dataclass
@@ -235,20 +224,19 @@ class DeleteRequest:
     paths: List[str]
     bucket: Optional[str] = None
     recursive: bool = False
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if not self.paths:
             raise ValueError('Paths list cannot be empty')
         for path in self.paths:
             if not path or not path.strip():
                 raise ValueError('Path cannot be empty')
-    
+
     def validate(self) -> DeleteRequestModel:
-        """Validate using Pydantic model."""
         return DeleteRequestModel(
             paths=self.paths,
             bucket=self.bucket,
-            recursive=self.recursive
+            recursive=self.recursive,
         )
 
 
@@ -268,20 +256,19 @@ class ListRequest:
     max_items: Optional[int] = None
     prefix: Optional[str] = None
     delimiter: Optional[str] = None
-    
-    def __post_init__(self):
+
+    def __post_init__(self) -> None:
         if self.max_items is not None and self.max_items <= 0:
             raise ValueError('max_items must be positive')
-    
+
     def validate(self) -> ListRequestModel:
-        """Validate using Pydantic model."""
         return ListRequestModel(
             path=self.path,
             bucket=self.bucket,
             recursive=self.recursive,
             max_items=self.max_items,
             prefix=self.prefix,
-            delimiter=self.delimiter
+            delimiter=self.delimiter,
         )
 
 
